@@ -15,16 +15,26 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct OverlayFS {
     layers: Vec<VfsPath>,
+    case_sensitive: bool,
 }
 
 impl OverlayFS {
     /// Create a new overlay FileSystem from the given layers, only the first layer is written to
     pub fn new(layers: &[VfsPath]) -> Self {
+        Self::new_with_case_sensitivity(layers, true)
+    }
+
+    /// Create a new overlay FileSystem with the requested path case sensitivity.
+    ///
+    /// When case-insensitive, entries whose names differ only by case are treated as the same
+    /// entry. The first (highest-priority) layer determines the casing exposed by the overlay.
+    pub fn new_with_case_sensitivity(layers: &[VfsPath], case_sensitive: bool) -> Self {
         if layers.is_empty() {
             panic!("OverlayFS needs at least one layer")
         }
         OverlayFS {
             layers: layers.to_vec(),
+            case_sensitive,
         }
     }
 
@@ -32,31 +42,140 @@ impl OverlayFS {
         &self.layers[0]
     }
 
-    fn read_path(&self, path: &str) -> VfsResult<VfsPath> {
-        if path.is_empty() {
-            return Ok(self.layers[0].clone());
+    fn name_key(&self, name: &str) -> String {
+        if self.case_sensitive {
+            name.to_string()
+        } else {
+            name.to_lowercase()
         }
+    }
+
+    fn relative_path(&self, path: &str) -> String {
+        let relative = path.strip_prefix('/').unwrap_or(path);
+        if self.case_sensitive {
+            relative.to_string()
+        } else {
+            relative.to_lowercase()
+        }
+    }
+
+    fn resolve_path(&self, path: &str) -> VfsResult<ResolvedPath> {
+        let components: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let mut layer_paths: Vec<Option<VfsPath>> = self.layers.iter().cloned().map(Some).collect();
+        let mut visible_path = String::new();
+
+        for component in components {
+            let key = self.name_key(component);
+            let mut matching_paths = vec![None; self.layers.len()];
+            let mut visible_name = None;
+            let mut visible_index = None;
+
+            for (index, parent) in layer_paths.iter().enumerate() {
+                let Some(parent) = parent else {
+                    continue;
+                };
+                if !parent.exists()?
+                    || parent.metadata()?.file_type != crate::VfsFileType::Directory
+                {
+                    continue;
+                }
+
+                let mut matching_name = None;
+                for entry in parent.read_dir()? {
+                    let name = entry.filename();
+                    if self.name_key(&name) == key {
+                        if name == component {
+                            matching_name = Some(name);
+                            break;
+                        }
+                        if matching_name.is_none() {
+                            matching_name = Some(name);
+                        }
+                    }
+                }
+
+                if let Some(name) = matching_name {
+                    let child = parent.join(&name)?;
+                    if visible_name.is_none() {
+                        visible_name = Some(name.clone());
+                        visible_index = Some(index);
+                    }
+                    matching_paths[index] = Some(child);
+                }
+            }
+
+            let visible_name = visible_name.ok_or(VfsErrorKind::FileNotFound)?;
+            if !visible_path.is_empty() {
+                visible_path.push('/');
+            }
+            visible_path.push_str(&visible_name);
+
+            let visible_entry = matching_paths
+                .iter()
+                .flatten()
+                .next()
+                .ok_or(VfsErrorKind::FileNotFound)?;
+            if visible_entry.metadata()?.file_type == crate::VfsFileType::Directory {
+                for child in &mut matching_paths {
+                    if let Some(path) = child {
+                        if path.metadata()?.file_type != crate::VfsFileType::Directory {
+                            *child = None;
+                        }
+                    }
+                }
+            } else {
+                for (index, child) in matching_paths.iter_mut().enumerate() {
+                    if Some(index) != visible_index {
+                        *child = None;
+                    }
+                }
+            }
+            layer_paths = matching_paths;
+        }
+
+        let visible = layer_paths
+            .iter()
+            .flatten()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| self.layers[0].clone());
+        Ok(ResolvedPath {
+            layer_paths,
+            visible_path,
+            visible,
+        })
+    }
+
+    fn read_path(&self, path: &str) -> VfsResult<VfsPath> {
         if self.whiteout_path(path)?.exists()? {
             return Err(VfsErrorKind::FileNotFound.into());
         }
-        for layer in &self.layers {
-            let layer_path = layer.join(&path[1..])?;
-            if layer_path.exists()? {
-                return Ok(layer_path);
-            }
-        }
-        let read_path = self.write_layer().join(&path[1..])?;
-        if !read_path.exists()? {
-            return Err(VfsErrorKind::FileNotFound.into());
-        }
-        Ok(read_path)
+        Ok(self.resolve_path(path)?.visible)
     }
 
     fn write_path(&self, path: &str) -> VfsResult<VfsPath> {
         if path.is_empty() {
             return Ok(self.layers[0].clone());
         }
-        self.write_layer().join(&path[1..])
+        let relative_path = match self.resolve_path(path) {
+            Ok(resolved) => resolved.visible_path,
+            Err(error) if matches!(error.kind(), VfsErrorKind::FileNotFound) => {
+                let separator = path.rfind('/');
+                let (parent, name) = match separator {
+                    Some(index) => (&path[..index], &path[index + 1..]),
+                    None => ("", path),
+                };
+                let parent_path = self.resolve_path(parent)?;
+                if parent_path.visible_path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", parent_path.visible_path, name)
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        self.write_layer().join(&relative_path)
     }
 
     fn whiteout_path(&self, path: &str) -> VfsResult<VfsPath> {
@@ -64,7 +183,17 @@ impl OverlayFS {
             return self.write_layer().join(".whiteout/_wo");
         }
         self.write_layer()
-            .join(format!(".whiteout/{}_wo", &path[1..]))
+            .join(format!(".whiteout/{}_wo", self.relative_path(path)))
+    }
+
+    fn whiteout_dir_path(&self, path: &str) -> VfsResult<VfsPath> {
+        let relative_path = self.relative_path(path);
+        if relative_path.is_empty() {
+            self.write_layer().join(".whiteout")
+        } else {
+            self.write_layer()
+                .join(format!(".whiteout/{}", relative_path))
+        }
     }
 
     fn ensure_has_parent(&self, path: &str) -> VfsResult<()> {
@@ -80,28 +209,40 @@ impl OverlayFS {
     }
 }
 
+struct ResolvedPath {
+    layer_paths: Vec<Option<VfsPath>>,
+    visible_path: String,
+    visible: VfsPath,
+}
+
 impl FileSystem for OverlayFS {
     fn read_dir(&self, path: &str) -> VfsResult<Box<dyn Iterator<Item = String> + Send>> {
-        let actual_path = if !path.is_empty() { &path[1..] } else { path };
-        if !self.read_path(path)?.exists()? {
+        let resolved = self.resolve_path(path)?;
+        if self.whiteout_path(path)?.exists()? {
             return Err(VfsErrorKind::FileNotFound.into());
         }
-        let mut entries = HashSet::<String>::new();
-        for layer in &self.layers {
-            let layer_path = layer.join(actual_path)?;
-            if layer_path.exists()? {
-                for path in layer_path.read_dir()? {
-                    entries.insert(path.filename());
+        if resolved.visible.metadata()?.file_type != crate::VfsFileType::Directory {
+            return Err(VfsErrorKind::FileNotFound.into());
+        }
+
+        let mut entries = Vec::<String>::new();
+        let mut entry_keys = HashSet::<String>::new();
+        for layer_path in resolved.layer_paths.into_iter().flatten() {
+            for entry in layer_path.read_dir()? {
+                let filename = entry.filename();
+                if entry_keys.insert(self.name_key(&filename)) {
+                    entries.push(filename);
                 }
             }
         }
         // remove whiteout entries that have been removed
-        let whiteout_path = self.write_layer().join(format!(".whiteout{path}"))?;
+        let whiteout_path = self.whiteout_dir_path(path)?;
         if whiteout_path.exists()? {
             for path in whiteout_path.read_dir()? {
                 let filename = path.filename();
                 if filename.ends_with("_wo") {
-                    entries.remove(&filename[..filename.len() - 3]);
+                    let key = self.name_key(&filename[..filename.len() - 3]);
+                    entries.retain(|entry| self.name_key(entry) != key);
                 }
             }
         }
@@ -243,6 +384,65 @@ mod tests {
         let mut paths: Vec<_> = entries.iter().map(|path| path.as_str()).collect();
         paths.sort();
         assert_eq!(paths, vec!["/foo/common", "/foo/lower", "/foo/upper"]);
+        Ok(())
+    }
+
+    #[test]
+    fn case_insensitive_directories_merge_using_uppercase() -> VfsResult<()> {
+        let lower_root: VfsPath = MemoryFS::new().into();
+        let upper_root: VfsPath = MemoryFS::new().into();
+        let overlay_root: VfsPath =
+            OverlayFS::new_with_case_sensitivity(&[upper_root.clone(), lower_root.clone()], false)
+                .into();
+
+        upper_root.join("sound/Music")?.create_dir_all()?;
+        lower_root.join("Sound/music")?.create_dir_all()?;
+        upper_root.join("sound/Music/upper.txt")?.create_file()?;
+        lower_root.join("Sound/music/lower.txt")?.create_file()?;
+
+        let root_entries: Vec<_> = overlay_root
+            .read_dir()?
+            .map(|path| path.as_str().to_string())
+            .collect();
+        assert_eq!(root_entries, vec!["/sound"]);
+        let sound_entries: Vec<_> = overlay_root
+            .join("SOUND")?
+            .read_dir()?
+            .map(|path| path.filename())
+            .collect();
+        assert_eq!(sound_entries, vec!["Music"]);
+        let music_entries: Vec<_> = overlay_root
+            .join("SOUND/mUsIc")?
+            .read_dir()?
+            .map(|path| path.filename())
+            .collect();
+        assert_eq!(music_entries.len(), 2);
+        assert!(music_entries.iter().any(|entry| entry == "upper.txt"));
+        assert!(music_entries.iter().any(|entry| entry == "lower.txt"));
+        assert!(overlay_root.join("sOuNd/mUsIc/lOwEr.TxT")?.exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn case_sensitive_directories_remain_separate() -> VfsResult<()> {
+        let lower_root: VfsPath = MemoryFS::new().into();
+        let upper_root: VfsPath = MemoryFS::new().into();
+        let overlay_root: VfsPath =
+            OverlayFS::new_with_case_sensitivity(&[upper_root.clone(), lower_root.clone()], true)
+                .into();
+
+        upper_root.join("sound")?.create_dir_all()?;
+        lower_root.join("Sound")?.create_dir_all()?;
+        upper_root.join("sound/upper.txt")?.create_file()?;
+        lower_root.join("Sound/lower.txt")?.create_file()?;
+
+        let root_entries: Vec<_> = overlay_root
+            .read_dir()?
+            .map(|path| path.as_str().to_string())
+            .collect();
+        assert_eq!(root_entries.len(), 2);
+        assert!(root_entries.iter().any(|entry| entry == "/sound"));
+        assert!(root_entries.iter().any(|entry| entry == "/Sound"));
         Ok(())
     }
 
